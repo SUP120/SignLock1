@@ -2,16 +2,23 @@ package com.sup.signlock.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val Primary = Color(0xFF4ECDC4)
-val Secondary = Color(0xFF2196F3)
-val Background = Color(0xFF0A0A0F)
-val Surface = Color(0xFF0F1923)
-val Error = Color(0xFFFF6B6B)
+// Professional College Project Theme
+val Primary = Color(0xFF1976D2)        // Deep Blue
+val Secondary = Color(0xFF388E3C)      // Green
+val Tertiary = Color(0xFFF57C00)       // Orange
+val Background = Color(0xFF0A0E27)     // Dark Navy
+val Surface = Color(0xFF1A1F3A)        // Lighter Navy
+val SurfaceVariant = Color(0xFF2A3F5F) // Blue-gray
+val Error = Color(0xFFE53935)          // Red
+val Success = Color(0xFF43A047)        // Green
+val Warning = Color(0xFFFB8C00)        // Orange
 
-val Purple80 = Color(0xFFD0BCFF)
-val PurpleGrey80 = Color(0xFFCCC2DC)
-val Pink80 = Color(0xFFEFB8C8)
+// Accent colors
+val AccentBlue = Color(0xFF42A5F5)
+val AccentGreen = Color(0xFF66BB6A)
+val AccentOrange = Color(0xFFFF9800)
 
-val Purple40 = Color(0xFF6650a4)
-val PurpleGrey40 = Color(0xFF625b71)
-val Pink40 = Color(0xFF7D5260)
+// Text colors
+val TextPrimary = Color(0xFFFFFFFF)
+val TextSecondary = Color(0xFFB0BEC5)
+val TextDisabled = Color(0xFF607D8B)

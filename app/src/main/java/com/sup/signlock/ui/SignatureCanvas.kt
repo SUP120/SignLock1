@@ -5,14 +5,12 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.unit.dp
 import com.sup.signlock.data.SignaturePoint
 import com.sup.signlock.data.SignatureStroke
 import kotlinx.coroutines.delay
@@ -66,8 +64,7 @@ fun SignatureCanvas(
                             scope.launch {
                                 delay(800)
                                 if (currentStroke.isEmpty() && strokes.isNotEmpty()) {
-                                    val totalTime = System
-.currentTimeMillis() - startTime
+                                    val totalTime = System.currentTimeMillis() - startTime
                                     onSignatureComplete(strokes, totalTime)
                                     strokes = emptyList()
                                     isDrawing = false

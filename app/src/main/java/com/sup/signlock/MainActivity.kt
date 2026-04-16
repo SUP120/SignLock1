@@ -10,12 +10,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import com.sup.signlock.data.PreferencesManager
 import com.sup.signlock.service.AppMonitorService
 import com.sup.signlock.ui.AppSelectionScreen
 import com.sup.signlock.ui.HomeScreen
 import com.sup.signlock.ui.SetupScreen
+import com.sup.signlock.ui.SplashScreen
+import com.sup.signlock.ui.theme.Background
 import com.sup.signlock.ui.theme.SignLockTheme
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -34,7 +35,7 @@ class MainActivity : ComponentActivity() {
             SignLockTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = Color(0xFF0A0A0F)
+                    color = Background
                 ) {
                     MainScreen()
                 }
@@ -46,6 +47,7 @@ class MainActivity : ComponentActivity() {
     fun MainScreen() {
         val scope = rememberCoroutineScope()
         
+        var showSplash by remember { mutableStateOf(true) }
         var isSetupComplete by remember { mutableStateOf(false) }
         var showAppSelection by remember { mutableStateOf(false) }
         var lockedApps by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -63,6 +65,13 @@ class MainActivity : ComponentActivity() {
         }
         
         when {
+            showSplash -> {
+                SplashScreen(
+                    onSplashComplete = {
+                        showSplash = false
+                    }
+                )
+            }
             !isSetupComplete -> {
                 SetupScreen(
                     onSetupComplete = { templates ->
