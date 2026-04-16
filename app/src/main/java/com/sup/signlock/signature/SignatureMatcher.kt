@@ -13,30 +13,20 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Smart signature matcher with strict verification.
+ * Strict segment-gated signature matcher.
  *
- * Three-layer architecture:
+ * Key innovation: the signature is split into 4 equal segments and
+ * EACH segment must independently score above a minimum threshold.
+ * This prevents "Supr" vs "Suti" from matching — even though the
+ * "Su" portion is similar, the "pr" vs "ti" segments will fail the gate.
  *
- *  LAYER 1 — Direct Point Comparison (weight 40%)
- *   After normalising and resampling to equidistant points, compares
- *   position-by-position. This is the STRICTEST check: point 30 of
- *   an "L" is in a completely different place to point 30 of an "S".
- *   No elastic warping → different shapes CANNOT cheat.
+ * Three layers:
+ *  1. Segment-gated direct comparison (40%) — position + angle, no warping
+ *  2. Banded DTW (25%) — handles natural variation
+ *  3. Feature histograms (35%) — direction, spatial, curvature, speed
  *
- *  LAYER 2 — Banded DTW (weight 25%)
- *   Direction-augmented DTW with Sakoe-Chiba band (±10 points).
- *   Allows slight timing/speed variation while rejecting large
- *   structural differences.
- *
- *  LAYER 3 — Feature Checks (weight 35%)
- *   Direction histogram, spatial grid density, curvature histogram,
- *   aspect ratio, velocity rhythm, stroke count.
- *
- *  GATES — Instant rejection if:
- *   • Direct similarity < 0.08  (completely different shape)
- *   • Stroke count differs by > 3
- *   • Aspect ratio ratio < 0.25
- *   • Path length ratio < 0.30
+ * The direct comparison uses an ADDITIVE angle penalty so that points
+ * at similar positions but with different pen directions score poorly.
  */
 class SignatureMatcher {
 
@@ -44,32 +34,37 @@ class SignatureMatcher {
         private const val TAG = "SignatureMatcher"
 
         // ── Layer weights (sum = 1.0) ──
-        private const val W_DIRECT     = 0.40f   // Direct point-to-point (strictest)
-        private const val W_DTW        = 0.25f   // Banded DTW (handles natural variation)
-        private const val W_DIR_HIST   = 0.12f   // Direction distribution
-        private const val W_GRID       = 0.08f   // Spatial layout
-        private const val W_CURVATURE  = 0.05f   // Curve pattern
-        private const val W_ASPECT     = 0.05f   // Proportions
-        private const val W_VELOCITY   = 0.03f   // Drawing rhythm
-        private const val W_STROKE     = 0.02f   // Stroke count
+        private const val W_DIRECT     = 0.40f
+        private const val W_DTW        = 0.25f
+        private const val W_DIR_HIST   = 0.12f
+        private const val W_GRID       = 0.08f
+        private const val W_CURVATURE  = 0.05f
+        private const val W_ASPECT     = 0.05f
+        private const val W_VELOCITY   = 0.03f
+        private const val W_STROKE     = 0.02f
 
         // ── Threshold ──
         private const val MATCH_THRESHOLD = 0.45f
 
+        // ── Segment gating ──
+        private const val SEGMENT_COUNT = 4            // Split each stroke into 4 parts
+        private const val MIN_SEGMENT_SCORE = 0.10f    // Every segment must pass this
+
         // ── Hard gates ──
-        private const val MIN_DIRECT_SCORE = 0.08f  // Below this = instant reject
+        private const val MIN_DIRECT_SCORE = 0.08f
         private const val MAX_STROKE_DIFF = 3
         private const val MIN_ASPECT_RATIO = 0.25f
         private const val MIN_PATH_RATIO = 0.30f
 
         // ── Algorithm params ──
         private const val RESAMPLE_N = 64
-        private const val DIRECT_SCALE = 14.0     // For point-to-point scoring
-        private const val DTW_SCALE = 14.0        // For DTW scoring
-        private const val DTW_BAND = 10           // Sakoe-Chiba bandwidth
-        private const val ANGLE_PENALTY = 1.5     // Direction mismatch multiplier
+        private const val DIRECT_SCALE = 18.0          // For segment scoring
+        private const val ANGLE_DIRECT_PENALTY = 20.0  // Additive angle penalty in direct comparison
+        private const val DTW_SCALE = 14.0
+        private const val DTW_BAND = 10
+        private const val ANGLE_DTW_PENALTY = 1.5      // Multiplicative in DTW
         private const val DIR_BINS = 8
-        private const val GRID_SIZE = 4           // 4×4 = 16 cells
+        private const val GRID_SIZE = 4
         private const val CURVE_BINS = 8
     }
 
@@ -79,7 +74,6 @@ class SignatureMatcher {
         val message: String
     )
 
-    // ── Feature bundle ───────────────────────────────────────────────
     private class Features(
         val dirHistogram: FloatArray,
         val gridDensity: FloatArray,
@@ -106,27 +100,20 @@ class SignatureMatcher {
 
         val inputFeatures = extractFeatures(inputSignature)
 
-        val scores = storedTemplates.map { template ->
-            val tf = extractFeatures(template)
-            compareAll(inputFeatures, tf)
+        val scores = storedTemplates.map { t ->
+            compareAll(inputFeatures, extractFeatures(t))
         }
 
         val maxScore = scores.maxOrNull() ?: 0f
         val avgScore = scores.average().toFloat()
-
-        // Equal weight on best match and consistency
         val finalScore = maxScore * 0.5f + avgScore * 0.5f
         val isMatch = finalScore >= MATCH_THRESHOLD
 
-        Log.d(TAG, "Per-template: $scores")
-        Log.d(TAG, "max=%.3f avg=%.3f final=%.3f match=$isMatch"
+        Log.d(TAG, "Per-template: $scores | max=%.3f avg=%.3f final=%.3f match=$isMatch"
             .format(maxScore, avgScore, finalScore))
 
-        return MatchResult(
-            isMatch = isMatch,
-            score = finalScore,
-            message = if (isMatch) "Signature matched!" else "Signature does not match"
-        )
+        return MatchResult(isMatch, finalScore,
+            if (isMatch) "Signature matched!" else "Signature does not match")
     }
 
     // =================================================================
@@ -139,18 +126,10 @@ class SignatureMatcher {
         val scale = 100f / dim
 
         val normStrokes = sig.strokes.map { s ->
-            s.points.map { p ->
-                SignaturePoint(
-                    (p.x - bbox.minX) * scale,
-                    (p.y - bbox.minY) * scale,
-                    p.timestamp
-                )
-            }
+            s.points.map { p -> SignaturePoint((p.x - bbox.minX) * scale, (p.y - bbox.minY) * scale, p.timestamp) }
         }
-
         val resampled = normStrokes.map { resamplePoints(it, RESAMPLE_N) }
         val angles = resampled.map { calculateAngles(it) }
-
         val allResampled = resampled.flatten()
         val allNorm = normStrokes.flatten()
 
@@ -176,33 +155,22 @@ class SignatureMatcher {
     // =================================================================
 
     private fun compareAll(input: Features, template: Features): Float {
-        // ── Quick rejects ──
-        if (abs(input.strokeCount - template.strokeCount) > MAX_STROKE_DIFF) {
-            Log.d(TAG, "REJECT: stroke count ${input.strokeCount} vs ${template.strokeCount}")
-            return 0f
-        }
-        if (safeRatio(input.aspectRatio, template.aspectRatio) < MIN_ASPECT_RATIO) {
-            Log.d(TAG, "REJECT: aspect ratio %.2f vs %.2f".format(input.aspectRatio, template.aspectRatio))
-            return 0f
-        }
-        if (safeRatio(input.normPathLength, template.normPathLength) < MIN_PATH_RATIO) {
-            Log.d(TAG, "REJECT: path length %.2f vs %.2f".format(input.normPathLength, template.normPathLength))
-            return 0f
-        }
+        // Quick rejects
+        if (abs(input.strokeCount - template.strokeCount) > MAX_STROKE_DIFF) return 0f
+        if (safeRatio(input.aspectRatio, template.aspectRatio) < MIN_ASPECT_RATIO) return 0f
+        if (safeRatio(input.normPathLength, template.normPathLength) < MIN_PATH_RATIO) return 0f
 
-        // ── LAYER 1: Direct point-to-point comparison ──
+        // LAYER 1: Segment-gated direct comparison
         val directScore = computeDirectScore(input, template)
-
-        // Hard gate: if shapes are completely different, stop here
         if (directScore < MIN_DIRECT_SCORE) {
-            Log.d(TAG, "GATE REJECT: direct score %.3f < %.3f".format(directScore, MIN_DIRECT_SCORE))
+            Log.d(TAG, "GATE REJECT: direct=%.3f".format(directScore))
             return 0f
         }
 
-        // ── LAYER 2: Banded DTW ──
+        // LAYER 2: Banded DTW
         val dtwScore = computeBandedDTWScore(input, template)
 
-        // ── LAYER 3: Feature scores ──
+        // LAYER 3: Features
         val dirScore = cosineSimilarity(input.dirHistogram, template.dirHistogram)
         val gridScore = cosineSimilarity(input.gridDensity, template.gridDensity)
         val curvScore = cosineSimilarity(input.curvHistogram, template.curvHistogram)
@@ -210,116 +178,138 @@ class SignatureMatcher {
         val aspectScore = compareRatio(input.aspectRatio, template.aspectRatio, 0f)
         val strokeScore = strokeCountScore(input.strokeCount, template.strokeCount)
 
-        val total = (directScore * W_DIRECT) +
-                (dtwScore * W_DTW) +
-                (dirScore * W_DIR_HIST) +
-                (gridScore * W_GRID) +
-                (curvScore * W_CURVATURE) +
-                (aspectScore * W_ASPECT) +
-                (velScore * W_VELOCITY) +
-                (strokeScore * W_STROKE)
+        val total = (directScore * W_DIRECT) + (dtwScore * W_DTW) +
+                (dirScore * W_DIR_HIST) + (gridScore * W_GRID) +
+                (curvScore * W_CURVATURE) + (aspectScore * W_ASPECT) +
+                (velScore * W_VELOCITY) + (strokeScore * W_STROKE)
 
-        Log.d(TAG, "DIRECT=%.3f DTW=%.3f dir=%.2f grid=%.2f curv=%.2f asp=%.2f vel=%.2f str=%.2f → %.3f"
+        Log.d(TAG, "DIR=%.3f DTW=%.3f dir=%.2f grid=%.2f curv=%.2f asp=%.2f vel=%.2f str=%.2f → %.3f"
             .format(directScore, dtwScore, dirScore, gridScore, curvScore, aspectScore, velScore, strokeScore, total))
 
         return total
     }
 
     // =================================================================
-    //  LAYER 1: DIRECT POINT-TO-POINT COMPARISON
+    //  LAYER 1: SEGMENT-GATED DIRECT COMPARISON
     // =================================================================
 
     /**
-     * Compares signatures point-by-point WITHOUT any elastic warping.
-     * After spatial resampling, point i = position (i/N) along the path.
-     * For the SAME word, these positions correspond to the same part of the writing.
-     * For DIFFERENT words, they correspond to completely different positions.
+     * Splits each stroke into 4 segments and computes a score per segment
+     * using position + angle (additive penalty). If ANY segment scores
+     * below MIN_SEGMENT_SCORE, the whole signature is rejected.
      *
-     * This is the primary discriminator — the one that actually rejects
-     * different letters/words reliably.
+     * This catches "Supr" vs "Suti": the "Su" segments pass, but the
+     * "pr" vs "ti" segments fail because positions AND angles differ.
+     *
+     * The additive angle penalty means even if two points are at similar
+     * positions, they score poorly if the pen was moving in a different
+     * direction (e.g. "p" curves down while "t" goes up).
      */
     private fun computeDirectScore(input: Features, template: Features): Float {
         val pairs = min(input.resampledStrokes.size, template.resampledStrokes.size)
         if (pairs == 0) return 0f
 
-        var totalScore = 0.0
+        var overallScore = 0.0
+        var worstSegment = Float.MAX_VALUE
+
         for (i in 0 until pairs) {
             val pts1 = input.resampledStrokes[i]
             val pts2 = template.resampledStrokes[i]
+            val a1 = input.strokeAngles[i]
+            val a2 = template.strokeAngles[i]
             val n = min(pts1.size, pts2.size)
-            if (n == 0) continue
+            if (n < SEGMENT_COUNT) continue
 
-            var totalDist = 0.0
-            for (j in 0 until n) {
-                totalDist += eucDist(pts1[j], pts2[j])
+            val segSize = n / SEGMENT_COUNT
+            var strokeScore = 0.0
+
+            for (seg in 0 until SEGMENT_COUNT) {
+                val start = seg * segSize
+                val end = if (seg == SEGMENT_COUNT - 1) n else (seg + 1) * segSize
+
+                var segDist = 0.0
+                for (j in start until end) {
+                    segDist += directDist(pts1[j], a1[j], pts2[j], a2[j])
+                }
+                val avgDist = segDist / (end - start)
+                val segScore = exp(-avgDist / DIRECT_SCALE).toFloat()
+
+                worstSegment = min(worstSegment, segScore)
+                strokeScore += segScore
+
+                Log.d(TAG, "  Stroke$i Seg$seg: avgDist=%.1f score=%.3f".format(avgDist, segScore))
             }
-            val avgDist = totalDist / n
-            totalScore += exp(-avgDist / DIRECT_SCALE)
+
+            overallScore += strokeScore / SEGMENT_COUNT
         }
 
-        return (totalScore / pairs).toFloat()
+        // SEGMENT GATE: if any part of the signature is very different, reject
+        if (worstSegment < MIN_SEGMENT_SCORE) {
+            Log.d(TAG, "SEGMENT GATE: worst=%.3f < %.3f → REJECT".format(worstSegment, MIN_SEGMENT_SCORE))
+            return worstSegment
+        }
+
+        return (overallScore / pairs).toFloat()
+    }
+
+    /**
+     * Combined distance: spatial + direction (additive).
+     *
+     * "p" going ↓ at position (50,70) vs "t" going ↑ at position (50,70):
+     *   posDist = 0, angleDiff = π, combined = 0 + π × 20 = 63
+     *   → score = exp(-63/18) = 0.03 → FAIL
+     *
+     * Same letter, slight variation:
+     *   posDist = 10, angleDiff = 0.3, combined = 10 + 0.3 × 20 = 16
+     *   → score = exp(-16/18) = 0.41 → PASS
+     */
+    private fun directDist(p1: SignaturePoint, a1: Float, p2: SignaturePoint, a2: Float): Double {
+        val posDist = eucDist(p1, p2)
+        var angleDiff = abs(a1 - a2).toDouble()
+        if (angleDiff > Math.PI) angleDiff = 2.0 * Math.PI - angleDiff
+        return posDist + angleDiff * ANGLE_DIRECT_PENALTY
     }
 
     // =================================================================
     //  LAYER 2: BANDED DTW
     // =================================================================
 
-    /**
-     * Direction-augmented DTW with Sakoe-Chiba band constraint.
-     * The band prevents excessive warping — the alignment must stay
-     * within ±10 positions of the diagonal. This allows slight natural
-     * variation while rejecting fundamentally different shapes.
-     */
     private fun computeBandedDTWScore(input: Features, template: Features): Float {
         val pairs = min(input.resampledStrokes.size, template.resampledStrokes.size)
         if (pairs == 0) return 0f
-
-        var totalScore = 0.0
+        var total = 0.0
         for (i in 0 until pairs) {
-            val pts1 = input.resampledStrokes[i]
-            val pts2 = template.resampledStrokes[i]
-            val a1 = input.strokeAngles[i]
-            val a2 = template.strokeAngles[i]
-
-            val dtw = bandedDirectionalDTW(pts1, a1, pts2, a2)
-            val pathLen = max(pts1.size, pts2.size)
-            val avg = if (pathLen > 0) dtw / pathLen else dtw
-
-            totalScore += exp(-avg / DTW_SCALE)
+            val dtw = bandedDTW(input.resampledStrokes[i], input.strokeAngles[i],
+                template.resampledStrokes[i], template.strokeAngles[i])
+            val pl = max(input.resampledStrokes[i].size, template.resampledStrokes[i].size)
+            total += exp(-(if (pl > 0) dtw / pl else dtw) / DTW_SCALE)
         }
-
-        return (totalScore / pairs).toFloat()
+        return (total / pairs).toFloat()
     }
 
-    private fun bandedDirectionalDTW(
-        seq1: List<SignaturePoint>, angles1: FloatArray,
-        seq2: List<SignaturePoint>, angles2: FloatArray
+    private fun bandedDTW(
+        s1: List<SignaturePoint>, a1: FloatArray,
+        s2: List<SignaturePoint>, a2: FloatArray
     ): Double {
-        val n = seq1.size; val m = seq2.size
+        val n = s1.size; val m = s2.size
         if (n == 0 || m == 0) return Double.MAX_VALUE
-
-        val dtw = Array(n + 1) { DoubleArray(m + 1) { Double.MAX_VALUE } }
-        dtw[0][0] = 0.0
-
+        val d = Array(n + 1) { DoubleArray(m + 1) { Double.MAX_VALUE } }
+        d[0][0] = 0.0
         for (i in 1..n) {
-            // Sakoe-Chiba band: only compute cells near the diagonal
-            val diagJ = (i.toLong() * m / n).toInt()  // position on diagonal
-            val jStart = max(1, diagJ - DTW_BAND)
-            val jEnd = min(m, diagJ + DTW_BAND)
-
-            for (j in jStart..jEnd) {
-                val cost = augmentedCost(seq1[i - 1], angles1[i - 1], seq2[j - 1], angles2[j - 1])
-                dtw[i][j] = cost + minOf(dtw[i - 1][j], dtw[i][j - 1], dtw[i - 1][j - 1])
+            val dj = (i.toLong() * m / n).toInt()
+            for (j in max(1, dj - DTW_BAND)..min(m, dj + DTW_BAND)) {
+                val cost = dtwCost(s1[i - 1], a1[i - 1], s2[j - 1], a2[j - 1])
+                d[i][j] = cost + minOf(d[i - 1][j], d[i][j - 1], d[i - 1][j - 1])
             }
         }
-        return dtw[n][m]
+        return d[n][m]
     }
 
-    private fun augmentedCost(p1: SignaturePoint, a1: Float, p2: SignaturePoint, a2: Float): Double {
-        val posDist = eucDist(p1, p2)
-        var aDiff = abs(a1 - a2).toDouble()
-        if (aDiff > Math.PI) aDiff = 2.0 * Math.PI - aDiff
-        return posDist * (1.0 + (aDiff / Math.PI) * ANGLE_PENALTY)
+    private fun dtwCost(p1: SignaturePoint, a1: Float, p2: SignaturePoint, a2: Float): Double {
+        val pd = eucDist(p1, p2)
+        var ad = abs(a1 - a2).toDouble()
+        if (ad > Math.PI) ad = 2.0 * Math.PI - ad
+        return pd * (1.0 + (ad / Math.PI) * ANGLE_DTW_PENALTY)
     }
 
     // =================================================================
@@ -330,56 +320,48 @@ class SignatureMatcher {
         val bins = FloatArray(DIR_BINS)
         if (points.size < 2) return bins
         for (i in 0 until points.size - 1) {
-            val dx = points[i + 1].x - points[i].x
-            val dy = points[i + 1].y - points[i].y
+            val dx = points[i + 1].x - points[i].x; val dy = points[i + 1].y - points[i].y
             if (dx == 0f && dy == 0f) continue
-            var angle = atan2(dy, dx)
-            if (angle < 0) angle += (2 * Math.PI).toFloat()
-            val bin = ((angle / (2 * Math.PI).toFloat()) * DIR_BINS).toInt().coerceIn(0, DIR_BINS - 1)
-            bins[bin]++
+            var a = atan2(dy, dx); if (a < 0) a += (2 * Math.PI).toFloat()
+            bins[((a / (2 * Math.PI).toFloat()) * DIR_BINS).toInt().coerceIn(0, DIR_BINS - 1)]++
         }
-        normalize(bins)
-        return bins
+        norm(bins); return bins
     }
 
     private fun computeGridDensity(points: List<SignaturePoint>): FloatArray {
         val cells = FloatArray(GRID_SIZE * GRID_SIZE)
-        for (pt in points) {
-            val c = ((pt.x / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
-            val r = ((pt.y / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
+        for (p in points) {
+            val c = ((p.x / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
+            val r = ((p.y / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
             cells[r * GRID_SIZE + c]++
         }
-        normalize(cells)
-        return cells
+        norm(cells); return cells
     }
 
-    private fun computeCurvatureHistogram(strokeAngles: List<FloatArray>): FloatArray {
+    private fun computeCurvatureHistogram(sa: List<FloatArray>): FloatArray {
         val bins = FloatArray(CURVE_BINS)
-        for (angles in strokeAngles) {
+        for (angles in sa) {
             if (angles.size < 2) continue
             for (i in 0 until angles.size - 1) {
                 var c = angles[i + 1] - angles[i]
                 while (c > Math.PI) c -= (2 * Math.PI).toFloat()
                 while (c < -Math.PI) c += (2 * Math.PI).toFloat()
-                val norm = (c + Math.PI.toFloat()) / (2 * Math.PI).toFloat()
-                bins[(norm * CURVE_BINS).toInt().coerceIn(0, CURVE_BINS - 1)]++
+                val n = (c + Math.PI.toFloat()) / (2 * Math.PI).toFloat()
+                bins[(n * CURVE_BINS).toInt().coerceIn(0, CURVE_BINS - 1)]++
             }
         }
-        normalize(bins)
-        return bins
+        norm(bins); return bins
     }
 
     private fun computeVelocityCV(points: List<SignaturePoint>): Float {
         if (points.size < 3) return 0f
         val speeds = (0 until points.size - 1).map { i ->
             val dx = points[i + 1].x - points[i].x; val dy = points[i + 1].y - points[i].y
-            val dist = sqrt(dx * dx + dy * dy)
-            dist / max(1L, points[i + 1].timestamp - points[i].timestamp).toFloat()
+            sqrt(dx * dx + dy * dy) / max(1L, points[i + 1].timestamp - points[i].timestamp).toFloat()
         }
         val mean = speeds.average().toFloat()
         if (mean < 0.0001f) return 0f
-        val std = sqrt(speeds.map { (it - mean).pow(2) }.average().toFloat())
-        return std / mean
+        return sqrt(speeds.map { (it - mean).pow(2) }.average().toFloat()) / mean
     }
 
     // =================================================================
@@ -389,9 +371,8 @@ class SignatureMatcher {
     private fun calculateAngles(points: List<SignaturePoint>): FloatArray {
         if (points.size < 2) return FloatArray(points.size)
         val a = FloatArray(points.size)
-        for (i in 0 until points.size - 1) {
+        for (i in 0 until points.size - 1)
             a[i] = atan2(points[i + 1].y - points[i].y, points[i + 1].x - points[i].x)
-        }
         a[points.size - 1] = a.getOrElse(points.size - 2) { 0f }
         return a
     }
@@ -400,21 +381,19 @@ class SignatureMatcher {
         if (points.size < 2) return points
         val totalLen = pathLength(points)
         if (totalLen < 0.001) return points
-
         val interval = totalLen / (n - 1)
         val result = mutableListOf(points[0])
         var acc = 0.0; var prev = points[0]; var idx = 1
-
         while (result.size < n - 1 && idx < points.size) {
             val d = eucDist(prev, points[idx])
             if (acc + d >= interval) {
                 val t = ((interval - acc) / d).toFloat().coerceIn(0f, 1f)
-                val np = SignaturePoint(
+                result.add(SignaturePoint(
                     prev.x + t * (points[idx].x - prev.x),
                     prev.y + t * (points[idx].y - prev.y),
                     prev.timestamp + ((points[idx].timestamp - prev.timestamp) * t).toLong()
-                )
-                result.add(np); prev = np; acc = 0.0
+                ))
+                prev = result.last(); acc = 0.0
             } else { acc += d; prev = points[idx]; idx++ }
         }
         while (result.size < n) result.add(points.last())
@@ -432,21 +411,20 @@ class SignatureMatcher {
         return if (d > 0f) (dot / d).coerceIn(0f, 1f) else 0f
     }
 
-    private fun compareRatio(a: Float, b: Float, default: Float): Float {
-        if (a < 0.0001f && b < 0.0001f) return default
+    private fun compareRatio(a: Float, b: Float, def: Float): Float {
+        if (a < 0.0001f && b < 0.0001f) return def
         return (min(a, b) / max(a, b).coerceAtLeast(0.0001f)).coerceIn(0f, 1f)
     }
 
     private fun safeRatio(a: Float, b: Float): Float {
-        val mx = max(a, b)
-        return if (mx > 0.0001f) min(a, b) / mx else 1f
+        val mx = max(a, b); return if (mx > 0.0001f) min(a, b) / mx else 1f
     }
 
     private fun strokeCountScore(a: Int, b: Int) = when (abs(a - b)) {
         0 -> 1f; 1 -> 0.8f; 2 -> 0.5f; else -> 0.2f
     }
 
-    private fun normalize(arr: FloatArray) {
+    private fun norm(arr: FloatArray) {
         val s = arr.sum(); if (s > 0) for (i in arr.indices) arr[i] /= s
     }
 
