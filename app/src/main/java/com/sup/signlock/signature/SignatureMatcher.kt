@@ -13,33 +13,51 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Signature matching engine using Direction-Augmented Dynamic Time Warping.
+ * Smart multi-feature signature matching engine.
  *
- * Key security features:
- *  1. Shape matching via DTW on normalised+resampled points
- *  2. Stroke DIRECTION analysis — two letters that pass through similar areas
- *     but curve differently will score very low
- *  3. Aspect ratio comparison — catches obviously different proportions
- *  4. Speed profiling — slow/deliberate drawing is penalised (likely forgery)
+ * Uses 7 independent analysis layers so that different letters/words
+ * are reliably rejected even if they share a similar overall size or speed:
+ *
+ *  1. Direction Histogram — distribution of stroke directions (8 bins)
+ *  2. Grid Density — WHERE ink is placed on a 4×4 spatial grid
+ *  3. Direction-Augmented DTW — fine-grained shape + direction comparison
+ *  4. Curvature Histogram — distribution of curve tightness/direction
+ *  5. Velocity Rhythm — coefficient of variation of drawing speed
+ *  6. Aspect Ratio — bounding box proportions
+ *  7. Stroke Count — number of separate strokes
+ *
+ * Quick-reject filters discard obviously different inputs before
+ * expensive DTW runs.
  */
 class SignatureMatcher {
 
     companion object {
         private const val TAG = "SignatureMatcher"
 
-        // --- Weights (must sum to 1.0) ---
-        private const val SHAPE_WEIGHT = 0.55f    // Position + direction DTW
-        private const val SPEED_WEIGHT = 0.20f    // Speed profiling
-        private const val ASPECT_WEIGHT = 0.15f   // Bounding box proportions
-        private const val STROKE_WEIGHT = 0.10f   // Stroke count similarity
+        // ── Weights (sum = 1.0) ──
+        private const val W_DIR_HIST   = 0.22f   // Direction distribution (best letter discriminator)
+        private const val W_GRID       = 0.18f   // Spatial layout
+        private const val W_DTW        = 0.20f   // Fine-grained shape + direction
+        private const val W_CURVATURE  = 0.15f   // Curve structure
+        private const val W_VELOCITY   = 0.10f   // Drawing rhythm / style
+        private const val W_ASPECT     = 0.10f   // Proportions
+        private const val W_STROKE     = 0.05f   // Stroke count
 
-        // --- Threshold ---
-        private const val MATCH_THRESHOLD = 0.50f
+        // ── Threshold ──
+        private const val MATCH_THRESHOLD = 0.48f
 
-        // --- Algorithm tuning ---
-        private const val RESAMPLE_COUNT = 64
-        private const val DTW_SCALE = 12.0        // Stricter than before
-        private const val ANGLE_PENALTY = 1.5     // How much direction mismatch amplifies cost
+        // ── Quick-reject limits ──
+        private const val MAX_STROKE_DIFF = 3
+        private const val MIN_ASPECT_RATIO = 0.25f
+        private const val MIN_PATH_RATIO = 0.30f
+
+        // ── Algorithm params ──
+        private const val RESAMPLE_N = 64
+        private const val DIR_BINS = 8
+        private const val GRID_SIZE = 4           // 4×4 = 16 cells
+        private const val CURVE_BINS = 8
+        private const val DTW_SCALE = 12.0
+        private const val ANGLE_PENALTY = 1.5
     }
 
     data class MatchResult(
@@ -48,9 +66,22 @@ class SignatureMatcher {
         val message: String
     )
 
-    // -----------------------------------------------------------------
-    //  Public API
-    // -----------------------------------------------------------------
+    // ─── Internal feature bundle ────────────────────────────────────
+    private class Features(
+        val dirHistogram: FloatArray,        // 8 direction bins
+        val gridDensity: FloatArray,         // 16 spatial cells
+        val curvHistogram: FloatArray,       // 8 curvature bins
+        val velocityCV: Float,               // speed coefficient of variation
+        val aspectRatio: Float,              // width / height
+        val strokeCount: Int,
+        val normPathLength: Float,           // total path / bbox diagonal
+        val resampledStrokes: List<List<SignaturePoint>>,
+        val strokeAngles: List<FloatArray>
+    )
+
+    // =================================================================
+    //  PUBLIC API
+    // =================================================================
 
     fun matchSignature(
         inputSignature: SignatureTemplate,
@@ -60,19 +91,19 @@ class SignatureMatcher {
             return MatchResult(false, 0f, "No templates stored")
         }
 
+        val inputFeatures = extractFeatures(inputSignature)
+
         val scores = storedTemplates.map { template ->
-            calculateSimilarityScore(inputSignature, template)
+            val templateFeatures = extractFeatures(template)
+            compareFeatures(inputFeatures, templateFeatures)
         }
 
         val maxScore = scores.maxOrNull() ?: 0f
         val avgScore = scores.average().toFloat()
-
-        // Blend: best match (60%) + consistency across all templates (40%)
         val finalScore = maxScore * 0.6f + avgScore * 0.4f
         val isMatch = finalScore >= MATCH_THRESHOLD
 
-        Log.d(TAG, "Per-template scores: $scores")
-        Log.d(TAG, "max=$maxScore  avg=$avgScore  final=$finalScore  match=$isMatch")
+        Log.d(TAG, "Per-template: $scores | max=$maxScore avg=$avgScore final=$finalScore match=$isMatch")
 
         return MatchResult(
             isMatch = isMatch,
@@ -81,240 +112,244 @@ class SignatureMatcher {
         )
     }
 
-    // -----------------------------------------------------------------
-    //  Composite score
-    // -----------------------------------------------------------------
+    // =================================================================
+    //  FEATURE EXTRACTION
+    // =================================================================
 
-    private fun calculateSimilarityScore(
-        input: SignatureTemplate,
-        template: SignatureTemplate
-    ): Float {
-        val shapeScore = calculateShapeScore(input, template)
-        val speedScore = calculateSpeedScore(input.totalTime, template.totalTime)
-        val aspectScore = calculateAspectRatioScore(input, template)
-        val strokeScore = calculateStrokeScore(input.strokes.size, template.strokes.size)
-
-        val total = (shapeScore * SHAPE_WEIGHT) +
-                (speedScore * SPEED_WEIGHT) +
-                (aspectScore * ASPECT_WEIGHT) +
-                (strokeScore * STROKE_WEIGHT)
-
-        Log.d(TAG, "shape=$shapeScore  speed=$speedScore  aspect=$aspectScore  stroke=$strokeScore  → $total")
-        return total
-    }
-
-    // -----------------------------------------------------------------
-    //  Shape score (direction-augmented DTW)
-    // -----------------------------------------------------------------
-
-    /**
-     * Compares two signatures using DTW with both position AND direction.
-     * This is the core discriminator — two different letters drawn in similar
-     * areas will score low because their stroke directions differ.
-     */
-    private fun calculateShapeScore(
-        input: SignatureTemplate,
-        template: SignatureTemplate
-    ): Float {
-        val normInput = normalizeAndResample(input)
-        val normTemplate = normalizeAndResample(template)
-
-        val pairCount = min(normInput.size, normTemplate.size)
-        if (pairCount == 0) return 0f
-
-        var totalScore = 0.0
-        for (i in 0 until pairCount) {
-            val pts1 = normInput[i].points
-            val pts2 = normTemplate[i].points
-
-            // Calculate stroke direction at every point
-            val angles1 = calculateAngles(pts1)
-            val angles2 = calculateAngles(pts2)
-
-            // Direction-augmented DTW
-            val dtw = calculateDirectionalDTW(pts1, angles1, pts2, angles2)
-
-            // Normalise by path length
-            val pathLen = max(pts1.size, pts2.size)
-            val avgDist = if (pathLen > 0) dtw / pathLen else dtw
-
-            // Exponential decay — stricter scale than before
-            val score = exp(-avgDist / DTW_SCALE)
-            totalScore += score
-        }
-
-        return (totalScore / pairCount).toFloat()
-    }
-
-    // -----------------------------------------------------------------
-    //  Aspect ratio score
-    // -----------------------------------------------------------------
-
-    /**
-     * Compares bounding box proportions. A cursive "L" (tall+narrow) vs
-     * a cursive "S" (wider) will score low here even before DTW runs.
-     */
-    private fun calculateAspectRatioScore(
-        input: SignatureTemplate,
-        template: SignatureTemplate
-    ): Float {
-        val iW = max(input.boundingBox.width, 1f)
-        val iH = max(input.boundingBox.height, 1f)
-        val tW = max(template.boundingBox.width, 1f)
-        val tH = max(template.boundingBox.height, 1f)
-
-        val inputRatio = iW / iH
-        val templateRatio = tW / tH
-
-        // Ratio-of-ratios: 1.0 = identical proportions
-        val minR = min(inputRatio, templateRatio)
-        val maxR = max(inputRatio, templateRatio)
-
-        return (minR / maxR).coerceIn(0f, 1f)
-    }
-
-    // -----------------------------------------------------------------
-    //  Speed score
-    // -----------------------------------------------------------------
-
-    private fun calculateSpeedScore(inputTime: Long, templateTime: Long): Float {
-        if (inputTime == 0L || templateTime == 0L) return 0.5f
-
-        val ratio = inputTime.toFloat() / templateTime.toFloat()
-
-        return when {
-            ratio < 0.25f -> 0.15f            // Way too fast
-            ratio < 0.4f  -> 0.45f            // Somewhat fast
-            ratio in 0.4f..1.8f -> {          // Natural range
-                val dev = abs(1f - ratio)
-                max(0.2f, 1f - dev * 0.45f)
-            }
-            ratio <= 2.5f -> 0.30f            // Slow — suspicious
-            ratio <= 3.5f -> 0.10f            // Very slow — tracing
-            else          -> 0.05f            // Extremely slow
-        }
-    }
-
-    // -----------------------------------------------------------------
-    //  Stroke count score
-    // -----------------------------------------------------------------
-
-    private fun calculateStrokeScore(inputCount: Int, templateCount: Int): Float {
-        if (inputCount == 0 || templateCount == 0) return 0f
-        return when (abs(inputCount - templateCount)) {
-            0 -> 1.0f
-            1 -> 0.80f
-            2 -> 0.50f
-            else -> 0.20f
-        }
-    }
-
-    // -----------------------------------------------------------------
-    //  Normalisation, resampling & angle computation
-    // -----------------------------------------------------------------
-
-    private fun normalizeAndResample(signature: SignatureTemplate): List<SignatureStroke> {
-        val bbox = signature.boundingBox
+    private fun extractFeatures(sig: SignatureTemplate): Features {
+        val bbox = sig.boundingBox
         val dim = max(bbox.width, bbox.height).coerceAtLeast(1f)
-        val scale = 100f / dim   // Uniform scale — preserves aspect ratio
+        val scale = 100f / dim
 
-        return signature.strokes.map { stroke ->
-            val scaled = stroke.points.map { pt ->
+        // 1. Normalise points to 0-100 (preserving aspect ratio)
+        val normStrokes = sig.strokes.map { stroke ->
+            stroke.points.map { pt ->
                 SignaturePoint(
                     x = (pt.x - bbox.minX) * scale,
                     y = (pt.y - bbox.minY) * scale,
                     timestamp = pt.timestamp
                 )
             }
-            SignatureStroke(resamplePoints(scaled, RESAMPLE_COUNT))
         }
+
+        // 2. Resample each stroke to fixed point count
+        val resampled = normStrokes.map { resamplePoints(it, RESAMPLE_N) }
+
+        // 3. Angles per resampled stroke
+        val angles = resampled.map { calculateAngles(it) }
+
+        // ── Direction histogram (from resampled → equidistant sampling) ──
+        val allResampled = resampled.flatten()
+        val dirHist = computeDirectionHistogram(allResampled)
+
+        // ── Grid density (from raw normalised → more spatial detail) ──
+        val allNorm = normStrokes.flatten()
+        val grid = computeGridDensity(allNorm)
+
+        // ── Curvature histogram (from per-stroke angles, merged) ──
+        val curvHist = computeCurvatureHistogram(angles)
+
+        // ── Velocity CV ──
+        val velCV = computeVelocityCV(allResampled)
+
+        // ── Aspect ratio ──
+        val ar = max(bbox.width, 1f) / max(bbox.height, 1f)
+
+        // ── Normalised path length ──
+        val totalPath = normStrokes.sumOf { pathLength(it) }
+        val diag = sqrt((bbox.width * bbox.width + bbox.height * bbox.height).toDouble()).coerceAtLeast(1.0)
+        val npl = (totalPath / diag).toFloat()
+
+        return Features(
+            dirHistogram = dirHist,
+            gridDensity = grid,
+            curvHistogram = curvHist,
+            velocityCV = velCV,
+            aspectRatio = ar,
+            strokeCount = sig.strokes.size,
+            normPathLength = npl,
+            resampledStrokes = resampled,
+            strokeAngles = angles
+        )
     }
 
-    /**
-     * Calculates the tangent angle (radians) at each point.
-     * Uses the direction toward the next point; last point copies the previous angle.
-     */
-    private fun calculateAngles(points: List<SignaturePoint>): FloatArray {
-        if (points.size < 2) return FloatArray(points.size) { 0f }
+    // =================================================================
+    //  FEATURE COMPARISON
+    // =================================================================
 
-        val angles = FloatArray(points.size)
+    private fun compareFeatures(input: Features, template: Features): Float {
+        // ── Quick reject (cheap checks first) ──
+        if (quickReject(input, template)) return 0f
+
+        // ── Individual scores ──
+        val dirScore    = cosineSimilarity(input.dirHistogram, template.dirHistogram)
+        val gridScore   = cosineSimilarity(input.gridDensity, template.gridDensity)
+        val curvScore   = cosineSimilarity(input.curvHistogram, template.curvHistogram)
+        val dtwScore    = computeDTWScore(input, template)
+        val velScore    = compareRatio(input.velocityCV, template.velocityCV, default = 0.5f)
+        val aspectScore = compareRatio(input.aspectRatio, template.aspectRatio, default = 0f)
+        val strokeScore = strokeCountScore(input.strokeCount, template.strokeCount)
+
+        val total = (dirScore * W_DIR_HIST) +
+                (gridScore * W_GRID) +
+                (dtwScore * W_DTW) +
+                (curvScore * W_CURVATURE) +
+                (velScore * W_VELOCITY) +
+                (aspectScore * W_ASPECT) +
+                (strokeScore * W_STROKE)
+
+        Log.d(TAG, "dir=%.2f grid=%.2f dtw=%.2f curv=%.2f vel=%.2f asp=%.2f str=%.2f → %.3f"
+            .format(dirScore, gridScore, dtwScore, curvScore, velScore, aspectScore, strokeScore, total))
+
+        return total
+    }
+
+    private fun quickReject(a: Features, b: Features): Boolean {
+        if (abs(a.strokeCount - b.strokeCount) > MAX_STROKE_DIFF) {
+            Log.d(TAG, "Quick reject: stroke count ${a.strokeCount} vs ${b.strokeCount}")
+            return true
+        }
+        val arRatio = safeRatio(a.aspectRatio, b.aspectRatio)
+        if (arRatio < MIN_ASPECT_RATIO) {
+            Log.d(TAG, "Quick reject: aspect ratio %.2f vs %.2f".format(a.aspectRatio, b.aspectRatio))
+            return true
+        }
+        val plRatio = safeRatio(a.normPathLength, b.normPathLength)
+        if (plRatio < MIN_PATH_RATIO) {
+            Log.d(TAG, "Quick reject: path length %.2f vs %.2f".format(a.normPathLength, b.normPathLength))
+            return true
+        }
+        return false
+    }
+
+    // =================================================================
+    //  HISTOGRAM COMPUTATION
+    // =================================================================
+
+    /**
+     * Direction histogram: bins the angle of movement between consecutive
+     * points into 8 compass sectors (N, NE, E, SE, S, SW, W, NW).
+     * Different letters produce dramatically different distributions.
+     */
+    private fun computeDirectionHistogram(points: List<SignaturePoint>): FloatArray {
+        val bins = FloatArray(DIR_BINS)
+        if (points.size < 2) return bins
+
         for (i in 0 until points.size - 1) {
             val dx = points[i + 1].x - points[i].x
             val dy = points[i + 1].y - points[i].y
-            angles[i] = atan2(dy, dx)
+            if (dx == 0f && dy == 0f) continue
+
+            var angle = atan2(dy, dx)                       // [-π, π]
+            if (angle < 0) angle += (2 * Math.PI).toFloat() // [0, 2π]
+
+            val bin = ((angle / (2 * Math.PI).toFloat()) * DIR_BINS)
+                .toInt().coerceIn(0, DIR_BINS - 1)
+            bins[bin]++
         }
-        angles[points.size - 1] = angles[points.size - 2]  // copy last
-        return angles
+
+        normalizeArray(bins)
+        return bins
     }
 
     /**
-     * Equi-distant point resampling ($1 Recogniser algorithm).
+     * Grid density: divides the 100×100 normalised canvas into a 4×4 grid
+     * and counts ink concentration per cell. Captures spatial layout.
      */
-    private fun resamplePoints(points: List<SignaturePoint>, n: Int): List<SignaturePoint> {
-        if (points.size < 2) return points
+    private fun computeGridDensity(points: List<SignaturePoint>): FloatArray {
+        val cells = FloatArray(GRID_SIZE * GRID_SIZE)
+        if (points.isEmpty()) return cells
 
-        val totalLen = pathLength(points)
-        if (totalLen < 0.001) return points
+        for (pt in points) {
+            val col = ((pt.x / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
+            val row = ((pt.y / 100f) * GRID_SIZE).toInt().coerceIn(0, GRID_SIZE - 1)
+            cells[row * GRID_SIZE + col]++
+        }
 
-        val interval = totalLen / (n - 1)
-        val result = mutableListOf(points[0])
-        var accumulated = 0.0
-        var prev = points[0]
-        var idx = 1
+        normalizeArray(cells)
+        return cells
+    }
 
-        while (result.size < n - 1 && idx < points.size) {
-            val d = euclideanDistance(prev, points[idx])
+    /**
+     * Curvature histogram: how the stroke curves at each point.
+     * Bins the angular change (curvature) into 8 sectors.
+     * Straight lines, gentle curves, and sharp turns have different profiles.
+     */
+    private fun computeCurvatureHistogram(strokeAngles: List<FloatArray>): FloatArray {
+        val bins = FloatArray(CURVE_BINS)
 
-            if (accumulated + d >= interval) {
-                val t = ((interval - accumulated) / d).toFloat().coerceIn(0f, 1f)
-                val newPt = SignaturePoint(
-                    x = prev.x + t * (points[idx].x - prev.x),
-                    y = prev.y + t * (points[idx].y - prev.y),
-                    timestamp = prev.timestamp +
-                            ((points[idx].timestamp - prev.timestamp) * t).toLong()
-                )
-                result.add(newPt)
-                prev = newPt
-                accumulated = 0.0
-            } else {
-                accumulated += d
-                prev = points[idx]
-                idx++
+        for (angles in strokeAngles) {
+            if (angles.size < 2) continue
+            for (i in 0 until angles.size - 1) {
+                var curv = angles[i + 1] - angles[i]
+                // Wrap to [-π, π]
+                while (curv > Math.PI)  curv -= (2 * Math.PI).toFloat()
+                while (curv < -Math.PI) curv += (2 * Math.PI).toFloat()
+
+                // Map [-π, π] → [0, CURVE_BINS-1]
+                val norm = (curv + Math.PI.toFloat()) / (2 * Math.PI).toFloat()
+                val bin = (norm * CURVE_BINS).toInt().coerceIn(0, CURVE_BINS - 1)
+                bins[bin]++
             }
         }
 
-        while (result.size < n) result.add(points.last())
-        return result.take(n)
+        normalizeArray(bins)
+        return bins
     }
-
-    private fun pathLength(points: List<SignaturePoint>): Double {
-        var len = 0.0
-        for (i in 1 until points.size) {
-            len += euclideanDistance(points[i - 1], points[i])
-        }
-        return len
-    }
-
-    // -----------------------------------------------------------------
-    //  Direction-Augmented DTW
-    // -----------------------------------------------------------------
 
     /**
-     * DTW where the cost at each cell includes both positional distance
-     * AND a penalty for differing stroke directions.
-     *
-     * Cost = euclidean_distance × (1 + angle_penalty × ANGLE_PENALTY)
-     *
-     * Same direction  → multiplier ≈ 1.0  (no extra cost)
-     * 90° different   → multiplier ≈ 1.75
-     * Opposite dir    → multiplier ≈ 2.5  (heavy cost)
+     * Velocity coefficient of variation — measures the RHYTHM of drawing.
+     * Same signer has consistent rhythm; a forger tracing slowly has CV ≈ 0.
      */
-    private fun calculateDirectionalDTW(
+    private fun computeVelocityCV(points: List<SignaturePoint>): Float {
+        if (points.size < 3) return 0f
+
+        val speeds = mutableListOf<Float>()
+        for (i in 0 until points.size - 1) {
+            val dx = points[i + 1].x - points[i].x
+            val dy = points[i + 1].y - points[i].y
+            val dist = sqrt(dx * dx + dy * dy)
+            val dt = max(1L, points[i + 1].timestamp - points[i].timestamp)
+            speeds.add(dist / dt.toFloat())
+        }
+
+        val mean = speeds.average().toFloat()
+        if (mean < 0.0001f) return 0f
+
+        val variance = speeds.map { (it - mean) * (it - mean) }.average().toFloat()
+        return sqrt(variance) / mean
+    }
+
+    // =================================================================
+    //  DTW (Direction-Augmented)
+    // =================================================================
+
+    private fun computeDTWScore(input: Features, template: Features): Float {
+        val pairs = min(input.resampledStrokes.size, template.resampledStrokes.size)
+        if (pairs == 0) return 0f
+
+        var totalScore = 0.0
+        for (i in 0 until pairs) {
+            val pts1 = input.resampledStrokes[i]
+            val pts2 = template.resampledStrokes[i]
+            val a1 = input.strokeAngles[i]
+            val a2 = template.strokeAngles[i]
+
+            val dtw = directionalDTW(pts1, a1, pts2, a2)
+            val pathLen = max(pts1.size, pts2.size)
+            val avg = if (pathLen > 0) dtw / pathLen else dtw
+
+            totalScore += exp(-avg / DTW_SCALE)
+        }
+
+        return (totalScore / pairs).toFloat()
+    }
+
+    private fun directionalDTW(
         seq1: List<SignaturePoint>, angles1: FloatArray,
         seq2: List<SignaturePoint>, angles2: FloatArray
     ): Double {
-        val n = seq1.size
-        val m = seq2.size
+        val n = seq1.size; val m = seq2.size
         if (n == 0 || m == 0) return Double.MAX_VALUE
 
         val dtw = Array(n + 1) { DoubleArray(m + 1) { Double.MAX_VALUE } }
@@ -322,42 +357,97 @@ class SignatureMatcher {
 
         for (i in 1..n) {
             for (j in 1..m) {
-                val cost = augmentedCost(
-                    seq1[i - 1], angles1[i - 1],
-                    seq2[j - 1], angles2[j - 1]
-                )
-                dtw[i][j] = cost + minOf(
-                    dtw[i - 1][j],
-                    dtw[i][j - 1],
-                    dtw[i - 1][j - 1]
-                )
+                val cost = augmentedCost(seq1[i - 1], angles1[i - 1], seq2[j - 1], angles2[j - 1])
+                dtw[i][j] = cost + minOf(dtw[i - 1][j], dtw[i][j - 1], dtw[i - 1][j - 1])
             }
         }
         return dtw[n][m]
     }
 
-    /**
-     * Combined distance: positional euclidean × directional multiplier.
-     */
-    private fun augmentedCost(
-        p1: SignaturePoint, angle1: Float,
-        p2: SignaturePoint, angle2: Float
-    ): Double {
-        val posDist = euclideanDistance(p1, p2)
-
-        // Angle difference in [0, π]
-        var angleDiff = abs(angle1 - angle2).toDouble()
-        if (angleDiff > Math.PI) angleDiff = 2.0 * Math.PI - angleDiff
-
-        // Normalise to [0, 1] and scale
-        val anglePenalty = angleDiff / Math.PI
-
-        return posDist * (1.0 + anglePenalty * ANGLE_PENALTY)
+    private fun augmentedCost(p1: SignaturePoint, a1: Float, p2: SignaturePoint, a2: Float): Double {
+        val posDist = eucDist(p1, p2)
+        var aDiff = abs(a1 - a2).toDouble()
+        if (aDiff > Math.PI) aDiff = 2.0 * Math.PI - aDiff
+        return posDist * (1.0 + (aDiff / Math.PI) * ANGLE_PENALTY)
     }
 
-    private fun euclideanDistance(a: SignaturePoint, b: SignaturePoint): Double {
-        val dx = (a.x - b.x).toDouble()
-        val dy = (a.y - b.y).toDouble()
+    // =================================================================
+    //  NORMALISATION & RESAMPLING
+    // =================================================================
+
+    private fun calculateAngles(points: List<SignaturePoint>): FloatArray {
+        if (points.size < 2) return FloatArray(points.size)
+        val a = FloatArray(points.size)
+        for (i in 0 until points.size - 1) {
+            a[i] = atan2(points[i + 1].y - points[i].y, points[i + 1].x - points[i].x)
+        }
+        a[points.size - 1] = a[points.size - 2]
+        return a
+    }
+
+    private fun resamplePoints(points: List<SignaturePoint>, n: Int): List<SignaturePoint> {
+        if (points.size < 2) return points
+        val totalLen = pathLength(points)
+        if (totalLen < 0.001) return points
+
+        val interval = totalLen / (n - 1)
+        val result = mutableListOf(points[0])
+        var acc = 0.0; var prev = points[0]; var idx = 1
+
+        while (result.size < n - 1 && idx < points.size) {
+            val d = eucDist(prev, points[idx])
+            if (acc + d >= interval) {
+                val t = ((interval - acc) / d).toFloat().coerceIn(0f, 1f)
+                val np = SignaturePoint(
+                    x = prev.x + t * (points[idx].x - prev.x),
+                    y = prev.y + t * (points[idx].y - prev.y),
+                    timestamp = prev.timestamp + ((points[idx].timestamp - prev.timestamp) * t).toLong()
+                )
+                result.add(np); prev = np; acc = 0.0
+            } else { acc += d; prev = points[idx]; idx++ }
+        }
+
+        while (result.size < n) result.add(points.last())
+        return result.take(n)
+    }
+
+    // =================================================================
+    //  UTILITIES
+    // =================================================================
+
+    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+        var dot = 0f; var nA = 0f; var nB = 0f
+        for (i in a.indices) { dot += a[i] * b[i]; nA += a[i] * a[i]; nB += b[i] * b[i] }
+        val denom = sqrt(nA) * sqrt(nB)
+        return if (denom > 0f) (dot / denom).coerceIn(0f, 1f) else 0f
+    }
+
+    private fun compareRatio(a: Float, b: Float, default: Float): Float {
+        if (a < 0.0001f && b < 0.0001f) return default
+        val mn = min(a, b); val mx = max(a, b)
+        return if (mx > 0.0001f) (mn / mx).coerceIn(0f, 1f) else default
+    }
+
+    private fun safeRatio(a: Float, b: Float): Float {
+        val mn = min(a, b); val mx = max(a, b)
+        return if (mx > 0.0001f) mn / mx else 1f
+    }
+
+    private fun strokeCountScore(a: Int, b: Int): Float = when (abs(a - b)) {
+        0 -> 1f; 1 -> 0.8f; 2 -> 0.5f; else -> 0.2f
+    }
+
+    private fun normalizeArray(arr: FloatArray) {
+        val total = arr.sum()
+        if (total > 0) for (i in arr.indices) arr[i] /= total
+    }
+
+    private fun pathLength(pts: List<SignaturePoint>): Double {
+        var l = 0.0; for (i in 1 until pts.size) l += eucDist(pts[i - 1], pts[i]); return l
+    }
+
+    private fun eucDist(a: SignaturePoint, b: SignaturePoint): Double {
+        val dx = (a.x - b.x).toDouble(); val dy = (a.y - b.y).toDouble()
         return sqrt(dx.pow(2) + dy.pow(2))
     }
 }
