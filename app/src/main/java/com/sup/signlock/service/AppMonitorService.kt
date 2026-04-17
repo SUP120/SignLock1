@@ -39,7 +39,7 @@ class AppMonitorService : Service() {
         private const val CHANNEL_ID = "AppMonitorChannel"
         private const val NOTIFICATION_ID = 1
         private const val CHECK_INTERVAL = 500L // Check every 500ms
-        private const val LOCK_SCREEN_COOLDOWN = 2000L // Don't re-launch within 2s
+        private const val LOCK_SCREEN_COOLDOWN = 5000L // Don't re-launch within 5s
 
         /**
          * Apps that have been successfully unlocked via signature.
@@ -103,6 +103,9 @@ class AppMonitorService : Service() {
 
         // Check if this app is locked AND not temporarily unlocked
         if (lockedApps.contains(currentApp) && !temporarilyUnlockedApps.contains(currentApp)) {
+            // Don't launch if a lock screen is already showing
+            if (LockScreenActivity.isShowing) return
+
             // Debounce: don't spam lock screens
             val now = System.currentTimeMillis()
             if (now - lastLockScreenTime > LOCK_SCREEN_COOLDOWN) {

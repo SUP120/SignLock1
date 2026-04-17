@@ -30,12 +30,18 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class LockScreenActivity : ComponentActivity() {
-    
+
+    companion object {
+        /** Prevents the service from stacking multiple lock screens */
+        @Volatile var isShowing = false
+    }
+
     private lateinit var lockedPackage: String
-    
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+        isShowing = true
+
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -49,28 +55,48 @@ class LockScreenActivity : ComponentActivity() {
                 WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
         }
-        
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        
+
         lockedPackage = intent.getStringExtra("locked_package") ?: ""
-        
+
         setContent {
             SignLockTheme {
                 LockScreen(
                     packageName = lockedPackage,
-                    onUnlocked = { finish() },
-                    onFailed = {
-                        moveTaskToBack(true)
+                    onUnlocked = {
+                        // Mark as unlocked so the service doesn't re-lock immediately
+                        AppMonitorService.temporarilyUnlockedApps.add(lockedPackage)
+                        isShowing = false
                         finish()
+                    },
+                    onFailed = {
+                        isShowing = false
+                        navigateToHome()
                     }
                 )
             }
         }
     }
-    
-    @Deprecated("Deprecated in Java")
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isShowing = false
+    }
+
+    @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        moveTaskToBack(true)
+        isShowing = false
+        navigateToHome()
+    }
+
+    private fun navigateToHome() {
+        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        startActivity(homeIntent)
+        finish()
     }
 }
 
